@@ -14,6 +14,7 @@ class CheckinStatus(Enum):
 
     SUCCESS = 0
     REPEAT = 1
+    DEVICE_MISMATCH = 4  # 自动化签到拦截（设备不匹配）
     FAILURE = -2
 
 
@@ -32,6 +33,18 @@ class APIEndpoint(Enum):
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
+
+
+class APIPlatform:
+    """UA 平台（用于规避设备不匹配拦截）"""
+
+    MACOS = "macos"
+    WINDOWS = "windows"
+
+    UA_MAP = {
+        MACOS: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+        WINDOWS: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+    }
 
 
 class LogEmoji:
@@ -106,7 +119,7 @@ class Config:
     DEFAULT_VERBOSE = False
 
     """默认域名"""
-    DOMAINS = ["glados.cloud", "glados.one"]
+    DOMAINS = ["glados.one"]
 
     """兑换计划列表"""
     EXCHANGE_PLANS = {
@@ -178,10 +191,11 @@ class API:
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
 
-    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False):
+    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False, platform: str = APIPlatform.MACOS):
         self.domain: str = domain
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
+        self.platform: str = platform
         self.headers: Dict[str, str] = self._get_headers()
         self.session = requests.Session()
         self.session.headers.update(self.headers)
@@ -209,9 +223,10 @@ class API:
 
     def _get_headers(self) -> Dict[str, str]:
         """获取请求头"""
+        ua = APIPlatform.UA_MAP.get(self.platform, APIPlatform.UA_MAP[APIPlatform.MACOS])
         return {
             "origin": f"https://{self.domain}",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+            "user-agent": ua,
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -262,6 +277,49 @@ class API:
         """执行签到"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
+
+        result = self._do_checkin(url, checkin_data, cookies)
+
+        # code 4: 检测到自动化签到（设备不匹配），切换 UA 平台重试一次
+        if result["code"] == CheckinStatus.DEVICE_MISMATCH:
+            self._log(
+                "warning",
+                LogEmoji.WARNING,
+                f"检测到自动化签到拦截 (code 4, reason: {result.get('reason', '')})，"
+                f"当前平台 {self.platform}，切换到另一平台重试",
+                force=True,
+            )
+            alt_platform = (
+                APIPlatform.WINDOWS if self.platform == APIPlatform.MACOS else APIPlatform.MACOS
+            )
+            old_ua = self.headers.get("user-agent")
+            self.platform = alt_platform
+            self.headers = self._get_headers()
+            self.session.headers.update(self.headers)
+            self._log("info", LogEmoji.PENDING, f"切换 UA 平台为 {alt_platform} 后重试签到", force=True)
+            result = self._do_checkin(url, checkin_data, cookies)
+            # 无论重试结果如何，恢复原 UA
+            self.platform = APIPlatform.MACOS if alt_platform == APIPlatform.WINDOWS else APIPlatform.WINDOWS
+            self.headers = self._get_headers()
+            self.session.headers.update(self.headers)
+
+            # 重试后若仍被拦截（code 4），视为失败
+            if result["code"] == CheckinStatus.DEVICE_MISMATCH:
+                self._log(
+                    "error",
+                    LogEmoji.FAIL,
+                    "切换 UA 平台后仍被拦截 (code 4)，签到失败",
+                    force=True,
+                )
+                result["code"] = CheckinStatus.FAILURE
+                result["status"] = "签到失败"
+                result["points"] = "0"
+                result["message"] = f"重试后仍被拦截: {result.get('message', '')}"
+
+        return result
+
+    def _do_checkin(self, url: str, checkin_data: Dict[str, str], cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
+        """执行一次签到请求"""
         response = self._make_request(url, "POST", checkin_data, cookies)
 
         result = {
@@ -289,6 +347,18 @@ class API:
                 result["status"] = "重复签到"
                 result["points"] = "0"
                 result["message"] = message
+            elif code == CheckinStatus.DEVICE_MISMATCH.value:
+                self._log(
+                    "info",
+                    LogEmoji.WARNING,
+                    f"{{ code : {code}, reason : {data.get('reason', '')}, message : {message} }}",
+                    force=True,
+                )
+                result["code"] = CheckinStatus.DEVICE_MISMATCH
+                result["status"] = "检测到自动化签到"
+                result["points"] = "0"
+                result["message"] = message
+                result["reason"] = data.get("reason", "")
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
                 result["code"] = CheckinStatus.FAILURE
@@ -498,9 +568,12 @@ class Checker:
 
         success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
+        device_mismatch_count = sum(1 for r in results if r["code"] == CheckinStatus.DEVICE_MISMATCH)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
 
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
+        if device_mismatch_count:
+            title += f", 拦截{device_mismatch_count}"
 
         send_content_lines = []
         log_content_lines = []
