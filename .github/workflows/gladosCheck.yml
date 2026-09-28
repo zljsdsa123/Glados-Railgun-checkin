@@ -3,7 +3,7 @@ name: auto check
 on:
   workflow_dispatch:
   push:
-    branches: [ master ]
+    branches: [ v1.0.0 ]
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
