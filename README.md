@@ -66,6 +66,7 @@
 
 - **2026-01**: 重构代码，添加log输出方便定位，支持新版网址，支持配置积分兑换策略。
 - **2026-04**: 优化代码逻辑，优化日志输出，支持[新版域名](https://railgun.info) ，在 GLADOS_COOKIES 中添加新版域名下的 cookies 即可使用。
+- **2026-11**: 接入签到挑战协议（`GET /api/user/checkin/challenge` 取 nonce → 2.5s 观测停顿 → `SHA-256(nonce + "." + "glados-observe-v1")` 计算 proof → 提交），可获取完整积分（Base/Plan/Streak/Cable）；补充会员等级、连签天数、总积分展示；签到失败时以非零退出码结束以便 Actions 告警。
 
 
 ## 问题排查与定位

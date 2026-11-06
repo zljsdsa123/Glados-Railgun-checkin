@@ -2,11 +2,26 @@ import requests
 import json
 import os
 import logging
+import hashlib
+import random
+import sys
+import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 from pypushdeer import PushDeer
 from logging_config import init_logger
+
+
+def _fmt_points(value: Union[int, float, str, None]) -> str:
+    """格式化积分数值，保留 Team 套餐的 .5 小数"""
+    if value is None:
+        return "0"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(num)) if num == int(num) else f"{num:.1f}"
 
 
 class CheckinStatus(Enum):
@@ -30,9 +45,47 @@ class APIEndpoint(Enum):
     """API端点"""
 
     CHECKIN = "/api/user/checkin"
+    CHALLENGE = "/api/user/checkin/challenge"
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
+
+
+class ChallengeConfig:
+    """签到挑战协议参数（与线上前端保持一致）"""
+
+    """proof 盐值，前端以字符码数组混淆存储，此处按实测值直接给出"""
+    SALT = "glados-observe-v1"
+
+    """proof 拼接符（实测为 "."，非文档所写的 ":"）"""
+    SEPARATOR = "."
+
+    """前端强制的最短观测间隔（毫秒）"""
+    MIN_OBSERVE_MS = 2500
+
+    """实际等待区间（秒），略长于下限并带抖动，避免固定时序特征"""
+    WAIT_RANGE = (2.8, 4.0)
+
+
+class VIPLevel:
+    """会员等级（与官网前端 w={0:"Free",10:"Free",11:"Edu",21:"Basic",31:"Pro",41:"Team",51:"Enterprise"} 一致）"""
+
+    NAMES = {
+        0: "Free",
+        10: "Free",
+        11: "Edu",
+        21: "Basic",
+        31: "Pro",
+        41: "Team",
+        51: "Enterprise",
+    }
+
+    @classmethod
+    def name_of(cls, vip: Union[int, str, None]) -> str:
+        try:
+            return cls.NAMES.get(int(vip), "Unknown")
+        except (TypeError, ValueError):
+            return "Unknown"
 
 
 class APIPlatform:
@@ -187,6 +240,7 @@ class API:
     """API 调用"""
 
     CHECKIN_URL = APIEndpoint.CHECKIN.value
+    CHALLENGE_URL = APIEndpoint.CHALLENGE.value
     STATUS_URL = APIEndpoint.STATUS.value
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
@@ -272,13 +326,74 @@ class API:
         """获取签到数据"""
         return {"token": self.domain}
 
+    @staticmethod
+    def compute_checkin_proof(nonce: str) -> str:
+        """计算签到 proof: SHA-256(nonce + "." + salt) 的 64 位小写十六进制"""
+        payload = f"{nonce}{ChallengeConfig.SEPARATOR}{ChallengeConfig.SALT}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _load_challenge(self, cookies: str) -> Optional[Dict[str, Union[str, int, float]]]:
+        """获取签到挑战 nonce 及其 ttl"""
+        url = self._get_full_url(self.CHALLENGE_URL)
+        response = self._make_request(url, "GET", cookies=cookies)
+
+        if not response:
+            return None
+
+        try:
+            data = response.json()
+        except ValueError:
+            self._log("error", LogEmoji.ERROR, "解析挑战响应失败（非 JSON）", force=True)
+            return None
+
+        code = data.get("code", -2)
+        nonce = data.get("nonce")
+
+        if code != 0 or not nonce:
+            self._log(
+                "warning",
+                LogEmoji.WARNING,
+                f"获取挑战失败 {{ code : {code}, message : {data.get('message', '')} }}",
+                force=True,
+            )
+            return None
+
+        ttl = data.get("ttl") or 300000
+        self._log("info", LogEmoji.PENDING, f"已获取挑战 nonce（ttl={ttl}ms）")
+        return {"nonce": nonce, "ttl": ttl, "at": time.monotonic()}
+
+    def solve_checkin_challenge(self, cookies: str) -> Optional[Dict[str, str]]:
+        """完整挑战流程：取 nonce -> 拟人停顿 -> 计算 proof"""
+        challenge = self._load_challenge(cookies)
+        if not challenge:
+            return None
+
+        # 模拟前端 2.5s 强制观测停顿，并加入抖动避免固定时序特征
+        wait = random.uniform(*ChallengeConfig.WAIT_RANGE)
+        elapsed_ms = (time.monotonic() - challenge["at"]) * 1000
+        if elapsed_ms < ChallengeConfig.MIN_OBSERVE_MS:
+            wait = max(wait, (ChallengeConfig.MIN_OBSERVE_MS - elapsed_ms) / 1000 + 0.3)
+
+        self._log("info", LogEmoji.PENDING, f"观测停顿 {wait:.2f}s 后提交")
+        time.sleep(wait)
+
+        nonce = str(challenge["nonce"])
+        proof = self.compute_checkin_proof(nonce)
+        self._log("info", LogEmoji.PENDING, f"已计算 proof: {proof[:16]}…")
+        return {"nonce": nonce, "proof": proof}
+
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
-        """执行签到"""
+        """执行签到（完整挑战协议）"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
 
-        result = self._do_checkin(url, checkin_data, cookies)
+        result = self._checkin_with_challenge(url, checkin_data, cookies)
+
+        # 网络异常（含超时）：nonce 可能已失效，重新申请后重试一次
+        if result["code"] == CheckinStatus.FAILURE and result.get("message") == "网络请求失败":
+            self._log("warning", LogEmoji.WARNING, "签到请求网络异常，重新申请 nonce 后重试一次", force=True)
+            result = self._checkin_with_challenge(url, checkin_data, cookies)
 
         # code 4: 检测到自动化签到（设备不匹配），切换 UA 平台重试一次
         if result["code"] == CheckinStatus.DEVICE_MISMATCH:
@@ -292,12 +407,11 @@ class API:
             alt_platform = (
                 APIPlatform.WINDOWS if self.platform == APIPlatform.MACOS else APIPlatform.MACOS
             )
-            old_ua = self.headers.get("user-agent")
             self.platform = alt_platform
             self.headers = self._get_headers()
             self.session.headers.update(self.headers)
             self._log("info", LogEmoji.PENDING, f"切换 UA 平台为 {alt_platform} 后重试签到", force=True)
-            result = self._do_checkin(url, checkin_data, cookies)
+            result = self._checkin_with_challenge(url, checkin_data, cookies)
             # 无论重试结果如何，恢复原 UA
             self.platform = APIPlatform.MACOS if alt_platform == APIPlatform.WINDOWS else APIPlatform.WINDOWS
             self.headers = self._get_headers()
@@ -318,6 +432,20 @@ class API:
 
         return result
 
+    def _checkin_with_challenge(self, url: str, base_data: Dict[str, str], cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
+        """申请挑战 -> 计算 proof -> 提交签到"""
+        challenge = self.solve_checkin_challenge(cookies)
+        if not challenge:
+            return {
+                "status": "签到失败",
+                "points": "0",
+                "message": "挑战获取失败",
+                "code": CheckinStatus.FAILURE,
+            }
+
+        checkin_data = {**base_data, **challenge}
+        return self._do_checkin(url, checkin_data, cookies)
+
     def _do_checkin(self, url: str, checkin_data: Dict[str, str], cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
         """执行一次签到请求"""
         response = self._make_request(url, "POST", checkin_data, cookies)
@@ -326,6 +454,8 @@ class API:
             "status": "签到失败",
             "points": "0",
             "message": "",
+            "streak": None,
+            "points_total": None,
             "code": CheckinStatus.FAILURE,
         }
 
@@ -333,20 +463,29 @@ class API:
             data = response.json()
             code = data.get("code", -2)
             message = data.get("message", "无消息字段")
-            points = str(data.get("points", 0))
+            points = data.get("points", 0)
+            streak = data.get("streak")
+            history = data.get("list") or []
+            balance = None
+            if history and isinstance(history[0], dict):
+                balance = history[0].get("balance")
 
             if code == CheckinStatus.SUCCESS.value:
                 self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
                 result["code"] = CheckinStatus.SUCCESS
                 result["status"] = "签到成功"
-                result["points"] = points
+                result["points"] = _fmt_points(points)
                 result["message"] = message
+                result["streak"] = streak
+                result["points_total"] = _fmt_points(balance) if balance is not None else None
             elif code == CheckinStatus.REPEAT.value:
                 self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
                 result["code"] = CheckinStatus.REPEAT
                 result["status"] = "重复签到"
                 result["points"] = "0"
                 result["message"] = message
+                result["streak"] = streak
+                result["points_total"] = _fmt_points(balance) if balance is not None else None
             elif code == CheckinStatus.DEVICE_MISMATCH.value:
                 self._log(
                     "info",
@@ -374,8 +513,8 @@ class API:
         return result
 
     @log_method
-    def get_status(self, cookies: str) -> Tuple[str, int]:
-        """获取状态"""
+    def get_status(self, cookies: str) -> Tuple[str, int, str]:
+        """获取状态（剩余天数 + 响应码 + 会员等级）"""
 
         url = self._get_full_url(self.STATUS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
@@ -383,22 +522,28 @@ class API:
         if response:
             data = response.json()
             code = data.get("code", -2)
-            left_days = data.get("data", {}).get("leftDays", None)
+            payload = data.get("data") or {}
+            left_days = payload.get("leftDays")
+            vip_name = VIPLevel.name_of(payload.get("vip"))
+
+            if code == -101:
+                self._log("error", LogEmoji.ERROR, "账号已过期 (code -101)", force=True)
+                return "已过期", code, vip_name
 
             if left_days is not None:
                 left_days_int = int(float(left_days))
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, leftDays : {left_days_int} 天}}")
-                return f"{left_days_int} 天", code
+                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, leftDays : {left_days_int} 天, vip : {vip_name}}}")
+                return f"{left_days_int} 天", code, vip_name
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}", force=True)
-                return "None 天", code
+                return "None 天", code, vip_name
         else:
             self._log("warning", LogEmoji.WARNING, "获取状态失败", force=True)
-            return "None 天", -2
+            return "None 天", -2, "Unknown"
 
     @log_method
-    def get_points(self, cookies: str) -> Tuple[str, int]:
-        """获取积分"""
+    def get_points(self, cookies: str) -> Tuple[str, int, Optional[int]]:
+        """获取积分（总积分 + 数值 + 连签天数）"""
         url = self._get_full_url(self.POINTS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
 
@@ -406,19 +551,19 @@ class API:
             data = response.json()
             code = data.get("code", -2)
             points = data.get("points", None)
+            streak = data.get("streak")
 
             if points is not None:
-                points_int = int(float(points))
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points_int} 积分}}")
-                points_str = f"{points_int} 积分"
-                points_num = points_int
-                return points_str, points_num
+                points_str = f"{_fmt_points(points)} 积分"
+                points_num = int(float(points))
+                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {_fmt_points(points)} 积分, streak : {streak}}}")
+                return points_str, points_num, streak
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}", force=True)
-                return "None 积分", 0
+                return "None 积分", 0, streak
         else:
             self._log("warning", LogEmoji.WARNING, "获取积分失败", force=True)
-            return "None 积分", 0
+            return "None 积分", 0, None
 
     @log_method
     def exchange(self, cookies: str, plan: str, required_points: int) -> str:
@@ -452,6 +597,8 @@ class CheckinResult:
     points: str = "0"
     days: str = "None"
     points_total: str = "None"
+    streak: str = "-"
+    vip: str = "Unknown"
     exchange: str = "未兑换"
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
 
@@ -528,19 +675,30 @@ class Checker:
         with API(domain, cookie_idx, verbose=self.config.verbose) as api:
             # 1. 获取状态
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
-            days_str, status_code = api.get_status(cookie)
+            days_str, status_code, vip_name = api.get_status(cookie)
             result.days = days_str
+            result.vip = vip_name
 
-            # 2. 签到
+            # 2. 签到（完整挑战协议）
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            result.points = str(checkin_result.get("points", "0"))
+            if checkin_result.get("streak") is not None:
+                result.streak = f"{checkin_result['streak']} 天"
 
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
-            points_str, points_num = api.get_points(cookie)
+            points_str, points_num, streak = api.get_points(cookie)
             result.points_total = points_str
+            if streak is not None:
+                result.streak = f"{streak} 天"
+            # 签到响应 list[0].balance 是签到后的即时余额，优先于 points 接口
+            if checkin_result.get("points_total") is not None:
+                result.points_total = f"{checkin_result['points_total']} 积分"
+            elif result.points_total == "None 积分" and points_num:
+                result.points_total = f"{points_num} 积分"
 
             # 4. 执行兑换（未配置有效兑换计划时跳过）
             if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
@@ -578,7 +736,10 @@ class Checker:
         send_content_lines = []
         log_content_lines = []
         for i, res in enumerate(results, 1):
-            line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
+            line = (
+                f"#{i} [{res['vip']}] 本次+{res['points']} 连签:{res['streak']} "
+                f"剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
+            )
             send_content_lines.append(line)
 
             if self.config.verbose:
@@ -598,6 +759,7 @@ logger = init_logger()
 
 def main():
     """主函数"""
+    exit_code = 0
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -606,6 +768,7 @@ def main():
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
             title, content = "# 未找到 cookies!", ""
+            exit_code = 1
         else:
             # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
@@ -616,16 +779,23 @@ def main():
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
+            if any(r["code"] == CheckinStatus.FAILURE for r in checker.get_results()):
+                exit_code = 1
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        exit_code = 1
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
     push_service = PushService(config if "config" in locals() else "")
     push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成")
+
+    if exit_code:
+        logger.error(f"{LogEmoji.ERROR} 存在失败账号，以非零退出码结束，触发 Actions 告警")
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":
