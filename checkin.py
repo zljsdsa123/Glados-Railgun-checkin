@@ -1,4 +1,3 @@
-import requests
 import json
 import os
 import logging
@@ -11,6 +10,12 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 from pypushdeer import PushDeer
 from logging_config import init_logger
+
+try:
+    # curl_cffi 复刻浏览器 TLS/HTTP2 指纹，Cloudflare Bot Management 会校验该指纹
+    from curl_cffi import requests as http_client
+except ImportError as e:  # pragma: no cover - 依赖缺失时的友好提示
+    raise SystemExit("缺少依赖 curl_cffi，请先执行 `pip install curl_cffi`") from e
 
 
 def _fmt_points(value: Union[int, float, str, None]) -> str:
@@ -30,6 +35,7 @@ class CheckinStatus(Enum):
     SUCCESS = 0
     REPEAT = 1
     DEVICE_MISMATCH = 4  # 自动化签到拦截（设备不匹配）
+    CLOUDFLARE_BLOCKED = 5  # Cloudflare 人机校验未通过
     FAILURE = -2
 
 
@@ -89,15 +95,24 @@ class VIPLevel:
 
 
 class APIPlatform:
-    """UA 平台（用于规避设备不匹配拦截）"""
+    """浏览器指纹平台（用于规避设备不匹配拦截）
+
+    不手写 UA：UA 与 sec-ch-ua / TLS 指纹必须自洽，由 curl_cffi 的 impersonate
+    配置统一给出。safari 配置本身不发送 sec-ch-ua 与 Upgrade-Insecure-Requests，
+    天然符合 XHR 请求形态；chrome 配置为 Windows 平台，切换平台时仍保持自洽。
+    """
 
     MACOS = "macos"
     WINDOWS = "windows"
 
-    UA_MAP = {
-        MACOS: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
-        WINDOWS: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+    IMPERSONATE_MAP = {
+        MACOS: "safari",
+        WINDOWS: "chrome",
     }
+
+    @classmethod
+    def impersonate_of(cls, platform: str) -> str:
+        return cls.IMPERSONATE_MAP.get(platform, cls.IMPERSONATE_MAP[cls.MACOS])
 
 
 class LogEmoji:
@@ -251,7 +266,7 @@ class API:
         self.verbose: bool = verbose
         self.platform: str = platform
         self.headers: Dict[str, str] = self._get_headers()
-        self.session = requests.Session()
+        self.session = http_client.Session(impersonate=APIPlatform.impersonate_of(self.platform))
         self.session.headers.update(self.headers)
 
     def __del__(self):
@@ -276,11 +291,25 @@ class API:
         return False
 
     def _get_headers(self) -> Dict[str, str]:
-        """获取请求头"""
-        ua = APIPlatform.UA_MAP.get(self.platform, APIPlatform.UA_MAP[APIPlatform.MACOS])
+        """获取请求头
+
+        UA / sec-ch-ua / sec-fetch-* / accept-encoding 由 impersonate 配置注入，
+        这里只覆盖接口请求需要与浏览器保持一致的部分。
+        """
         return {
             "origin": f"https://{self.domain}",
-            "user-agent": ua,
+            "referer": f"https://{self.domain}/console/checkin",
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "priority": "u=1, i",
+            # 键名带 ";" 是 libcurl 语义：移除该头。chrome 指纹配置默认会带这几个
+            # 文档导航才有的头，XHR 请求带着反而异常，这里显式剔除。
+            "upgrade-insecure-requests;": "",
+            "sec-fetch-user;": "",
+            "cache-control;": "",
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -300,7 +329,7 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "") -> Optional[requests.Response]:
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "") -> Optional[http_client.Response]:
         """发送 HTTP 请求"""
         session_headers = self.headers.copy()
         session_headers["cookie"] = cookies
@@ -318,7 +347,7 @@ class API:
                 self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
                 return None
             return response
-        except requests.exceptions.RequestException as e:
+        except http_client.exceptions.RequestException as e:
             self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
             return None
 
@@ -395,7 +424,23 @@ class API:
             self._log("warning", LogEmoji.WARNING, "签到请求网络异常，重新申请 nonce 后重试一次", force=True)
             result = self._checkin_with_challenge(url, checkin_data, cookies)
 
-        # code 4: 检测到自动化签到（设备不匹配），切换 UA 平台重试一次
+        # code 5: Cloudflare 人机校验未通过，重新申请 nonce 后重试一次
+        if result["code"] == CheckinStatus.CLOUDFLARE_BLOCKED:
+            self._log(
+                "warning",
+                LogEmoji.WARNING,
+                f"Cloudflare 校验未通过 (code 5, message: {result.get('message', '')})，重新申请 nonce 后重试一次",
+                force=True,
+            )
+            result = self._checkin_with_challenge(url, checkin_data, cookies)
+            if result["code"] == CheckinStatus.CLOUDFLARE_BLOCKED:
+                self._log("error", LogEmoji.FAIL, "重试后仍被 Cloudflare 拦截 (code 5)", force=True)
+                result["code"] = CheckinStatus.FAILURE
+                result["status"] = "签到失败"
+                result["points"] = "0"
+                result["message"] = f"Cloudflare 拦截: {result.get('message', '')}"
+
+        # code 4: 检测到自动化签到（设备不匹配），切换指纹平台重试一次
         if result["code"] == CheckinStatus.DEVICE_MISMATCH:
             self._log(
                 "warning",
@@ -404,25 +449,22 @@ class API:
                 f"当前平台 {self.platform}，切换到另一平台重试",
                 force=True,
             )
+            original_platform = self.platform
             alt_platform = (
                 APIPlatform.WINDOWS if self.platform == APIPlatform.MACOS else APIPlatform.MACOS
             )
-            self.platform = alt_platform
-            self.headers = self._get_headers()
-            self.session.headers.update(self.headers)
-            self._log("info", LogEmoji.PENDING, f"切换 UA 平台为 {alt_platform} 后重试签到", force=True)
+            self._switch_platform(alt_platform)
+            self._log("info", LogEmoji.PENDING, f"切换指纹平台为 {alt_platform} 后重试签到", force=True)
             result = self._checkin_with_challenge(url, checkin_data, cookies)
-            # 无论重试结果如何，恢复原 UA
-            self.platform = APIPlatform.MACOS if alt_platform == APIPlatform.WINDOWS else APIPlatform.WINDOWS
-            self.headers = self._get_headers()
-            self.session.headers.update(self.headers)
+            # 无论重试结果如何，恢复原平台
+            self._switch_platform(original_platform)
 
             # 重试后若仍被拦截（code 4），视为失败
             if result["code"] == CheckinStatus.DEVICE_MISMATCH:
                 self._log(
                     "error",
                     LogEmoji.FAIL,
-                    "切换 UA 平台后仍被拦截 (code 4)，签到失败",
+                    "切换指纹平台后仍被拦截 (code 4)，签到失败",
                     force=True,
                 )
                 result["code"] = CheckinStatus.FAILURE
@@ -431,6 +473,14 @@ class API:
                 result["message"] = f"重试后仍被拦截: {result.get('message', '')}"
 
         return result
+
+    def _switch_platform(self, platform: str) -> None:
+        """切换浏览器指纹平台（impersonate 绑定在 Session 上，需重建 Session）"""
+        self.platform = platform
+        self.headers = self._get_headers()
+        self.close()
+        self.session = http_client.Session(impersonate=APIPlatform.impersonate_of(platform))
+        self.session.headers.update(self.headers)
 
     def _checkin_with_challenge(self, url: str, base_data: Dict[str, str], cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
         """申请挑战 -> 计算 proof -> 提交签到"""
@@ -498,6 +548,17 @@ class API:
                 result["points"] = "0"
                 result["message"] = message
                 result["reason"] = data.get("reason", "")
+            elif code == CheckinStatus.CLOUDFLARE_BLOCKED.value:
+                self._log(
+                    "info",
+                    LogEmoji.WARNING,
+                    f"{{ code : {code}, message : {message} }}",
+                    force=True,
+                )
+                result["code"] = CheckinStatus.CLOUDFLARE_BLOCKED
+                result["status"] = "Cloudflare 校验未通过"
+                result["points"] = "0"
+                result["message"] = message
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
                 result["code"] = CheckinStatus.FAILURE
