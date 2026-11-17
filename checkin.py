@@ -35,7 +35,7 @@ class CheckinStatus(Enum):
     SUCCESS = 0
     REPEAT = 1
     DEVICE_MISMATCH = 4  # 自动化签到拦截（设备不匹配）
-    CLOUDFLARE_BLOCKED = 5  # Cloudflare 人机校验未通过
+    TURNSTILE_FAILED = 5  # Turnstile 人机校验未通过（服务端返回 reason: turnstile）
     FAILURE = -2
 
 
@@ -361,8 +361,8 @@ class API:
         payload = f"{nonce}{ChallengeConfig.SEPARATOR}{ChallengeConfig.SALT}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def _load_challenge(self, cookies: str) -> Optional[Dict[str, Union[str, int, float]]]:
-        """获取签到挑战 nonce 及其 ttl"""
+    def _load_challenge(self, cookies: str) -> Optional[Dict[str, Union[str, int, float, None]]]:
+        """获取签到挑战 nonce、ttl 及 Turnstile 要求"""
         url = self._get_full_url(self.CHALLENGE_URL)
         response = self._make_request(url, "GET", cookies=cookies)
 
@@ -388,8 +388,14 @@ class API:
             return None
 
         ttl = data.get("ttl") or 300000
-        self._log("info", LogEmoji.PENDING, f"已获取挑战 nonce（ttl={ttl}ms）")
-        return {"nonce": nonce, "ttl": ttl, "at": time.monotonic()}
+        # 服务端按风控结果决定是否下发 Turnstile sitekey；下发则签到必须携带 token
+        turnstile = data.get("turnstile") or None
+        self._log(
+            "info",
+            LogEmoji.PENDING,
+            f"已获取挑战 nonce（ttl={ttl}ms, turnstile={'required' if turnstile else 'off'}）",
+        )
+        return {"nonce": nonce, "ttl": ttl, "turnstile": turnstile, "at": time.monotonic()}
 
     def solve_checkin_challenge(self, cookies: str) -> Optional[Dict[str, str]]:
         """完整挑战流程：取 nonce -> 拟人停顿 -> 计算 proof"""
@@ -409,7 +415,22 @@ class API:
         nonce = str(challenge["nonce"])
         proof = self.compute_checkin_proof(nonce)
         self._log("info", LogEmoji.PENDING, f"已计算 proof: {proof[:16]}…")
-        return {"nonce": nonce, "proof": proof}
+
+        # 前端无论是否需要 Turnstile 都会提交 tsState；无 Turnstile 时固定为 off
+        payload = {"nonce": nonce, "proof": proof, "tsState": "off"}
+
+        if challenge.get("turnstile"):
+            # Turnstile token 需由真实浏览器执行 JS 取得，curl_cffi 无法伪造；
+            # 按前端失败分支的语义以 tsState=error 提交，由服务端最终裁决
+            payload["tsState"] = "error"
+            self._log(
+                "warning",
+                LogEmoji.WARNING,
+                "服务端下发 Turnstile 人机校验，脚本无浏览器会话无法取得 token，本次提交大概率被拒绝",
+                force=True,
+            )
+
+        return payload
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
@@ -424,21 +445,20 @@ class API:
             self._log("warning", LogEmoji.WARNING, "签到请求网络异常，重新申请 nonce 后重试一次", force=True)
             result = self._checkin_with_challenge(url, checkin_data, cookies)
 
-        # code 5: Cloudflare 人机校验未通过，重新申请 nonce 后重试一次
-        if result["code"] == CheckinStatus.CLOUDFLARE_BLOCKED:
+        # Turnstile 人机校验未通过：token 只能由真实浏览器执行 JS 取得，
+        # 重新申请 nonce 解决不了，直接给出明确失败原因
+        if result["code"] == CheckinStatus.TURNSTILE_FAILED:
             self._log(
-                "warning",
-                LogEmoji.WARNING,
-                f"Cloudflare 校验未通过 (code 5, message: {result.get('message', '')})，重新申请 nonce 后重试一次",
+                "error",
+                LogEmoji.FAIL,
+                f"Turnstile 人机校验未通过 (message: {result.get('message', '')})，"
+                "需要真实浏览器会话才能取得 token，跳过重试",
                 force=True,
             )
-            result = self._checkin_with_challenge(url, checkin_data, cookies)
-            if result["code"] == CheckinStatus.CLOUDFLARE_BLOCKED:
-                self._log("error", LogEmoji.FAIL, "重试后仍被 Cloudflare 拦截 (code 5)", force=True)
-                result["code"] = CheckinStatus.FAILURE
-                result["status"] = "签到失败"
-                result["points"] = "0"
-                result["message"] = f"Cloudflare 拦截: {result.get('message', '')}"
+            result["code"] = CheckinStatus.FAILURE
+            result["status"] = "签到失败"
+            result["points"] = "0"
+            result["message"] = f"Turnstile 校验未通过: {result.get('message', '')}"
 
         # code 4: 检测到自动化签到（设备不匹配），切换指纹平台重试一次
         if result["code"] == CheckinStatus.DEVICE_MISMATCH:
@@ -513,6 +533,7 @@ class API:
             data = response.json()
             code = data.get("code", -2)
             message = data.get("message", "无消息字段")
+            reason = data.get("reason", "")
             points = data.get("points", 0)
             streak = data.get("streak")
             history = data.get("list") or []
@@ -540,25 +561,27 @@ class API:
                 self._log(
                     "info",
                     LogEmoji.WARNING,
-                    f"{{ code : {code}, reason : {data.get('reason', '')}, message : {message} }}",
+                    f"{{ code : {code}, reason : {reason}, message : {message} }}",
                     force=True,
                 )
                 result["code"] = CheckinStatus.DEVICE_MISMATCH
                 result["status"] = "检测到自动化签到"
                 result["points"] = "0"
                 result["message"] = message
-                result["reason"] = data.get("reason", "")
-            elif code == CheckinStatus.CLOUDFLARE_BLOCKED.value:
+                result["reason"] = reason
+            elif code == CheckinStatus.TURNSTILE_FAILED.value or reason == "turnstile":
+                # 前端以 reason: "turnstile" 判定人机校验失败，code 值可能变化
                 self._log(
                     "info",
                     LogEmoji.WARNING,
-                    f"{{ code : {code}, message : {message} }}",
+                    f"{{ code : {code}, reason : {reason}, message : {message} }}",
                     force=True,
                 )
-                result["code"] = CheckinStatus.CLOUDFLARE_BLOCKED
-                result["status"] = "Cloudflare 校验未通过"
+                result["code"] = CheckinStatus.TURNSTILE_FAILED
+                result["status"] = "Turnstile 校验未通过"
                 result["points"] = "0"
                 result["message"] = message
+                result["reason"] = reason
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
                 result["code"] = CheckinStatus.FAILURE
