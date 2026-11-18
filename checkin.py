@@ -446,7 +446,9 @@ class API:
             result = self._checkin_with_challenge(url, checkin_data, cookies)
 
         # Turnstile 人机校验未通过：token 只能由真实浏览器执行 JS 取得，
-        # 重新申请 nonce 解决不了，直接给出明确失败原因
+        # 重新申请 nonce 解决不了，直接给出明确失败原因。
+        # 保留 TURNSTILE_FAILED 状态而非归并为 FAILURE：风控是否下发校验由服务端
+        # 决定，脚本无从规避，因此该状态只如实呈现、不计入非零退出码。
         if result["code"] == CheckinStatus.TURNSTILE_FAILED:
             self._log(
                 "error",
@@ -455,8 +457,7 @@ class API:
                 "需要真实浏览器会话才能取得 token，跳过重试",
                 force=True,
             )
-            result["code"] = CheckinStatus.FAILURE
-            result["status"] = "签到失败"
+            result["status"] = "Turnstile 未通过"
             result["points"] = "0"
             result["message"] = f"Turnstile 校验未通过: {result.get('message', '')}"
 
@@ -811,11 +812,14 @@ class Checker:
         success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
         device_mismatch_count = sum(1 for r in results if r["code"] == CheckinStatus.DEVICE_MISMATCH)
+        turnstile_count = sum(1 for r in results if r["code"] == CheckinStatus.TURNSTILE_FAILED)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
 
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
         if device_mismatch_count:
             title += f", 拦截{device_mismatch_count}"
+        if turnstile_count:
+            title += f", Turnstile{turnstile_count}"
 
         send_content_lines = []
         log_content_lines = []
@@ -863,7 +867,16 @@ def main():
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
-            if any(r["code"] == CheckinStatus.FAILURE for r in checker.get_results()):
+
+            results = checker.get_results()
+            # Turnstile 未通过属于服务端风控结果，脚本无从规避，仅记录不告警，
+            # 避免 Actions 每天发送失败邮件；真实失败（网络/挑战/鉴权）仍以非零退出码告警。
+            if any(r["code"] == CheckinStatus.TURNSTILE_FAILED for r in results):
+                logger.warning(
+                    f"{LogEmoji.WARNING} 存在 Turnstile 人机校验未通过的账号，"
+                    "已如实记录但不计入失败退出码（如需真实浏览器会话请改用本机/住宅 IP 运行）"
+                )
+            if any(r["code"] == CheckinStatus.FAILURE for r in results):
                 exit_code = 1
 
     except Exception as e:

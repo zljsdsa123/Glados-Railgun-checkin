@@ -68,7 +68,7 @@
 - **2026-04**: 优化代码逻辑，优化日志输出，支持[新版域名](https://railgun.info) ，在 GLADOS_COOKIES 中添加新版域名下的 cookies 即可使用。
 - **2026-11**: 接入签到挑战协议（`GET /api/user/checkin/challenge` 取 nonce → 2.5s 观测停顿 → `SHA-256(nonce + "." + "glados-observe-v1")` 计算 proof → 提交），可获取完整积分（Base/Plan/Streak/Cable）；补充会员等级、连签天数、总积分展示；签到失败时以非零退出码结束以便 Actions 告警。
 - **2026-11**: HTTP 客户端由 `requests` 换成 `curl_cffi`，复刻浏览器 TLS/HTTP2 指纹以通过 Cloudflare 校验；请求头改为按 XHR 形态完整构造（`referer` / `accept` / `sec-fetch-*` 等），UA 与 `sec-ch-ua` 由指纹配置统一生成、保持自洽；新增 `code 5`（Turnstile 校验未通过）识别。
-- **2026-11**: 签到请求体对齐前端协议，补充 `tsState` 字段；识别 challenge 响应中的 `turnstile`（服务端按风控决定是否下发）并按 `reason: "turnstile"` 判定人机校验失败。Turnstile token 只能由真实浏览器执行 JS 取得，脚本拿不到时直接失败并给出明确原因，不再做无效的 nonce 重试。
+- **2026-11**: 签到请求体对齐前端协议，补充 `tsState` 字段；识别 challenge 响应中的 `turnstile`（服务端按风控决定是否下发）并按 `reason: "turnstile"` 判定人机校验失败。Turnstile token 只能由真实浏览器执行 JS 取得，脚本拿不到时直接失败并给出明确原因，不再做无效的 nonce 重试。Turnstile 属服务端风控结果、脚本无从规避，故仅如实记录并计入总结，不触发非零退出码，避免 Actions 每日发送失败邮件；其余真实失败（网络 / 挑战获取 / 鉴权）仍以非零退出码告警。
 
 
 ## 问题排查与定位
@@ -76,7 +76,11 @@
 
   <img width="1684" height="844" alt="image" src="https://github.com/user-attachments/assets/45348a5f-43e4-45f5-8fdf-ce84d343b30d" />
 
-- 日志出现 `Turnstile 人机校验未通过`：说明服务端已对本次请求下发 Turnstile 人机校验（签到响应 `reason: "turnstile"`）。token 必须由真实浏览器执行 JS 取得，纯 HTTP 脚本无法生成；浏览器里的 `cf_clearance` 又绑定 IP + UA 且有有效期，无法在 GitHub Actions 上复用。需要在此状态下签到成功，只能改用带真实浏览器的方案。
+- 日志出现 `Turnstile 人机校验未通过`：说明服务端已对本次请求下发 Turnstile 人机校验（签到响应 `reason: "turnstile"`），日志与推送会如实记录该状态，但**不会**让 Actions 任务失败、也不会发送失败邮件。
+
+  Turnstile token 由 Cloudflare 风控引擎签发，纯 HTTP 客户端（`requests` / `httpx` / `curl_cffi`）没有 JS 引擎，无论怎样伪造 TLS 指纹或请求头都取不到 token；浏览器里的 `cf_clearance` 又绑定 IP + UA 且有有效期，无法在 GitHub Actions 上复用。真正的诱因是**出口 IP**：GitHub Actions 是机房 IP，信誉分极低，因此常被要求人机校验；同样的 Cookie 在家庭宽带（住宅 IP）上往往静默通过，token 字段会自行填充。
+
+  因此要在此状态下签到成功，只能改用带真实浏览器 / 住宅 IP 的方案（例如把脚本放到本机家庭宽带定时运行），而非继续调参请求头。
 
 ## 声明
 
